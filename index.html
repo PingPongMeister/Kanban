@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP Kanban (USB)</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:#1e1f24;color:#e8e8ea}
+header{display:flex;align-items:center;gap:10px;padding:10px 16px;background:#2a2c33;position:sticky;top:0;z-index:2}
+h1{font-size:18px;margin:0;flex:1}
+#st{font-size:12px;color:#9aa0a6}
+#st.on{color:#6fd28f}
+button{background:#3a3d46;color:#e8e8ea;border:0;border-radius:6px;padding:6px 10px;cursor:pointer;font:inherit;font-size:14px}
+button:hover{background:#4a4e59}
+button:disabled{opacity:.4;cursor:default}
+main{display:flex;gap:12px;padding:16px;overflow-x:auto;align-items:flex-start;min-height:calc(100vh - 52px)}
+.hint{margin:auto;text-align:center;color:#9aa0a6;max-width:420px;line-height:1.5}
+.col{background:#2a2c33;border-radius:10px;min-width:270px;max-width:270px;display:flex;flex-direction:column;max-height:calc(100vh - 90px)}
+.ch{display:flex;align-items:center;padding:10px 10px 6px 12px}
+.ch h2{font-size:15px;margin:0;flex:1;cursor:text}
+.ib{background:none;padding:2px 6px;color:#9aa0a6;font-size:16px}
+.list{flex:1;overflow-y:auto;padding:4px 8px;min-height:40px;border-radius:8px}
+.list.over{background:#33363f}
+.card{background:#3a3d46;border-radius:7px;padding:8px 10px;margin-bottom:8px;border-left:4px solid #9aa0a6;cursor:grab;word-wrap:break-word}
+.card.drag{opacity:.4}
+.ct{font-size:14px}
+.cd{font-size:12px;color:#b5b8bf;margin-top:4px;white-space:pre-wrap}
+.add{margin:6px 8px 10px;background:none;color:#9aa0a6;text-align:left}
+.add:hover{background:#33363f;color:#e8e8ea}
+dialog{background:#2a2c33;color:#e8e8ea;border:0;border-radius:10px;width:min(420px,92vw);padding:16px}
+dialog::backdrop{background:#0008}
+dialog form{display:flex;flex-direction:column;gap:10px}
+input,textarea,select{background:#1e1f24;color:#e8e8ea;border:1px solid #444;border-radius:6px;padding:8px;font:inherit;width:100%}
+label{font-size:13px;color:#b5b8bf;display:flex;flex-direction:column;gap:4px}
+.row{display:flex;gap:8px}.row span{flex:1}
+.danger{background:#7a2b2b}.danger:hover{background:#963535}
+.ok{background:#2f6f45}.ok:hover{background:#38854f}
+</style></head><body>
+<header><h1>ESP Kanban</h1><span id="st">Nicht verbunden</span>
+<button id="conn">Mit ESP verbinden</button>
+<button id="addCol" disabled>+ Spalte</button>
+<button id="exp" disabled>Export</button></header>
+<main id="b"><div class="hint">ESP per USB anschliessen und auf <b>„Mit ESP verbinden“</b> klicken.<br>
+Funktioniert in Chrome, Edge oder Opera, auch ohne Internet.</div></main>
+<dialog id="dlg"><form method="dialog">
+<input id="ft" placeholder="Titel" required maxlength="120">
+<textarea id="fd" placeholder="Beschreibung (optional)" rows="4" maxlength="1000"></textarea>
+<label>Priorität<select id="fp"><option value="0">Keine</option><option value="1">Niedrig</option><option value="2">Mittel</option><option value="3">Hoch</option></select></label>
+<label>Spalte<select id="fc"></select></label>
+<div class="row"><button type="button" id="fdel" class="danger">Löschen</button><span></span>
+<button value="cancel" formnovalidate>Abbrechen</button><button value="ok" class="ok">Speichern</button></div>
+</form></dialog>
+<script>
+const $=s=>document.querySelector(s),dlg=$('#dlg');
+const PRIO=['#9aa0a6','#4caf50','#ff9800','#f44336'];
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const el=(t,c)=>{const e=document.createElement(t);if(c)e.className=c;return e};
+const st=(t,on)=>{const s=$('#st');s.textContent=t;s.className=on?'on':''};
+let B=null,drag=null,E=null;
+let port=null,writer=null,connected=false,pong=false,saving=false,dirty=false,saveTimer=null;
+
+// ---------- USB / Web Serial ----------
+async function connect(p){
+  if(!('serial' in navigator)){alert('Dein Browser kann kein Web Serial. Bitte Chrome oder Edge verwenden.');return}
+  try{
+    port=p||await navigator.serial.requestPort();
+    await port.open({baudRate:115200});
+  }catch(e){st('Verbindung fehlgeschlagen');return}
+  writer=port.writable.getWriter();
+  connected=true;$('#conn').textContent='Trennen';
+  readLoop();handshake();
+}
+async function disconnect(){
+  connected=false;
+  try{writer&&writer.releaseLock()}catch(e){}
+  try{await port.close()}catch(e){}
+}
+function onDisconnected(){
+  connected=false;port=null;writer=null;B=null;
+  $('#conn').textContent='Mit ESP verbinden';$('#addCol').disabled=$('#exp').disabled=true;
+  st('Nicht verbunden');
+  $('#b').innerHTML='<div class="hint">Verbindung getrennt. ESP anschliessen und neu verbinden.</div>';
+}
+async function readLoop(){
+  const dec=new TextDecoder();let buf='';
+  const reader=port.readable.getReader();
+  try{
+    while(true){
+      const{value,done}=await reader.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});let i;
+      while((i=buf.indexOf('\n'))>=0){const l=buf.slice(0,i).replace(/\r$/,'');buf=buf.slice(i+1);onLine(l)}
+    }
+  }catch(e){}
+  finally{try{reader.releaseLock()}catch(e){}await disconnect();onDisconnected()}
+}
+async function send(text){
+  const data=new TextEncoder().encode(text);
+  for(let i=0;i<data.length;i+=256)await writer.write(data.slice(i,i+256));
+}
+async function handshake(){
+  st('Verbinde…');pong=false;
+  await send('\n');
+  for(let i=0;i<20&&!pong&&connected;i++){await send('KB:PING\n');await sleep(300)} // Zeit für Reset beim Öffnen
+  if(!pong){st('ESP antwortet nicht – läuft das Kanban-Modul?');return}
+  await send('KB:GET\n');
+}
+function onLine(l){
+  if(l==='KB:PONG')pong=true;
+  else if(l.startsWith('KB:DATA ')){
+    try{B=JSON.parse(l.slice(8))}catch(e){st('Board auf dem ESP ist beschädigt');return}
+    if(!B.cols)B={cols:[]};
+    $('#addCol').disabled=$('#exp').disabled=false;render();st('Verbunden',true);
+  }
+  else if(l.startsWith('KB:OK')){saving=false;st('Gespeichert',true);if(dirty){dirty=false;save()}}
+  else if(l.startsWith('KB:ERR')){saving=false;st('Fehler: '+l.slice(7))}
+  // andere Zeilen (z. B. Debug-Ausgaben vom Makropad) werden ignoriert
+}
+async function save(){
+  if(!connected)return;
+  if(saving){dirty=true;return}
+  saving=true;st('Speichere…');
+  try{await send('KB:PUT '+JSON.stringify(B)+'\n')}catch(e){saving=false;st('Senden fehlgeschlagen')}
+}
+function commit(){render();clearTimeout(saveTimer);saveTimer=setTimeout(save,300)}
+
+// ---------- Oberfläche ----------
+function render(){
+  const m=$('#b');m.innerHTML='';if(!B)return;
+  B.cols.forEach((col,ci)=>{
+    const c=el('section','col'),h=el('div','ch'),t=el('h2'),x=el('button','ib');
+    t.textContent=col.n+' ('+col.cards.length+')';t.title='Doppelklick zum Umbenennen';
+    t.ondblclick=()=>{const n=prompt('Spaltenname',col.n);if(n&&n.trim()){col.n=n.trim();commit()}};
+    x.textContent='×';x.title='Spalte löschen';
+    x.onclick=()=>{if(col.cards.length&&!confirm('Spalte mit '+col.cards.length+' Karten löschen?'))return;B.cols.splice(ci,1);commit()};
+    h.append(t,x);
+    const list=el('div','list');
+    list.ondragover=e=>{e.preventDefault();list.classList.add('over')};
+    list.ondragleave=()=>list.classList.remove('over');
+    list.ondrop=e=>{
+      e.preventDefault();list.classList.remove('over');if(!drag)return;
+      const cards=[...list.querySelectorAll('.card')];let idx=cards.length;
+      for(let i=0;i<cards.length;i++){const r=cards[i].getBoundingClientRect();if(e.clientY<r.top+r.height/2){idx=i;break}}
+      const[fc,fi]=drag;drag=null;
+      const card=B.cols[fc].cards.splice(fi,1)[0];
+      if(fc===ci&&fi<idx)idx--;
+      col.cards.splice(idx,0,card);commit();
+    };
+    col.cards.forEach((k,ki)=>{
+      const d=el('div','card'),tt=el('div','ct');
+      d.draggable=true;d.style.borderLeftColor=PRIO[k.p||0];
+      tt.textContent=k.t;d.append(tt);
+      if(k.d){const dd=el('div','cd');dd.textContent=k.d;d.append(dd)}
+      d.ondragstart=e=>{drag=[ci,ki];d.classList.add('drag');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','')};
+      d.ondragend=()=>{d.classList.remove('drag');drag=null};
+      d.onclick=()=>edit(ci,ki);
+      list.append(d);
+    });
+    const a=el('button','add');a.textContent='+ Karte hinzufügen';a.onclick=()=>edit(ci,-1);
+    c.append(h,list,a);m.append(c);
+  });
+}
+function edit(ci,ki){
+  E=[ci,ki];const k=ki<0?{t:'',d:'',p:0}:B.cols[ci].cards[ki];
+  $('#ft').value=k.t;$('#fd').value=k.d||'';$('#fp').value=k.p||0;
+  const s=$('#fc');s.innerHTML='';B.cols.forEach((c,i)=>s.add(new Option(c.n,i)));s.value=ci;
+  $('#fdel').style.display=ki<0?'none':'';
+  dlg.returnValue='';dlg.showModal();$('#ft').focus();
+}
+dlg.onclose=()=>{
+  if(dlg.returnValue!=='ok'||!E||!B)return;
+  const[ci,ki]=E;E=null;
+  const k={t:$('#ft').value.trim(),d:$('#fd').value.trim(),p:+$('#fp').value};
+  if(!k.t)return;
+  const to=+$('#fc').value;
+  if(ki>=0){const o=B.cols[ci].cards.splice(ki,1)[0];k.id=o.id;k.c=o.c}
+  else{k.id=Date.now().toString(36);k.c=Date.now()}
+  if(ki>=0&&to===ci)B.cols[ci].cards.splice(ki,0,k);else B.cols[to].cards.push(k);
+  commit();
+};
+$('#fdel').onclick=()=>{
+  if(!confirm('Karte löschen?'))return;
+  const[ci,ki]=E;E=null;B.cols[ci].cards.splice(ki,1);dlg.close();commit();
+};
+$('#addCol').onclick=()=>{const n=prompt('Name der neuen Spalte');if(n&&n.trim()){B.cols.push({n:n.trim(),cards:[]});commit()}};
+$('#exp').onclick=()=>{
+  const a=el('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(B,null,2)],{type:'application/json'}));
+  a.download='kanban.json';a.click();URL.revokeObjectURL(a.href);
+};
+$('#conn').onclick=()=>connected?disconnect():connect();
+
+// Schon einmal erlaubten ESP automatisch verbinden
+if('serial' in navigator){
+  navigator.serial.getPorts().then(p=>{if(p.length===1)connect(p[0])});
+  navigator.serial.addEventListener('connect',e=>{if(!connected)connect(e.target)});
+}
+</script></body></html>
